@@ -1,120 +1,181 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 
 --// Settings
-local autoWheelie = false
+local anchored = false
+local wheelieActive = false
+local flyActive = false
+local hardModeActive = false
+local guiVisible = true
 
---// Auto Wheelie
-local function getVehicleSeat()
-	local character = player.Character
-	if not character then return nil end
+local FLY_HEIGHT = 80
+local FLY_SPEED  = 60
 
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	if not humanoid then return nil end
+--// ─────────────────────────────────────────
+--// Helpers
+--// ─────────────────────────────────────────
 
-	local seat = humanoid.SeatPart
+-- Returns the VehicleSeat the local player is currently sitting in, or nil
+local function getOccupiedSeat()
+    local character = player.Character
+    if not character then return nil end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return nil end
 
-	if seat and seat:IsA("VehicleSeat") then
-		return seat
-	end
-
-	return nil
+    -- Walk every VehicleSeat in the world
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("VehicleSeat") and obj.Occupant == humanoid then
+            return obj
+        end
+    end
+    return nil
 end
 
-RunService.Heartbeat:Connect(function()
-	if not autoWheelie then
-		return
-	end
+-- Returns the root/primary part of whatever model the seat belongs to
+local function getVehicleRoot(seat)
+    if not seat then return nil end
+    local model = seat:FindFirstAncestorOfClass("Model")
+    if not model then return seat end
+    return model.PrimaryPart or model:FindFirstChild("Body")
+        or model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChildWhichIsA("BasePart")
+end
 
-	local seat = getVehicleSeat()
-	if not seat then
-		return
-	end
+--// ─────────────────────────────────────────
+--// Anchor
+--// ─────────────────────────────────────────
+local function setAnchored(state)
+    anchored = state
+    local character = player.Character
+    if not character then return end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root then root.Anchored = state end
+end
 
-	-- Apply a small backward rotation to create the wheelie effect
-	local vehicle = seat:FindFirstAncestorOfClass("Model")
-	if not vehicle then
-		return
-	end
-
-	local root = vehicle.PrimaryPart or seat
-
-	if root and root:IsA("BasePart") then
-		root.AssemblyAngularVelocity = Vector3.new(
-			-3,
-			root.AssemblyAngularVelocity.Y,
-			root.AssemblyAngularVelocity.Z
-		)
-	end
-end)
-
---// Character
 player.CharacterAdded:Connect(function(character)
-	character:WaitForChild("Humanoid")
+    local root = character:WaitForChild("HumanoidRootPart")
+    root.Anchored = anchored
 end)
 
---// GUI
-local gui = Instance.new("ScreenGui")
-gui.Name = "ReconScripts"
-gui.ResetOnSpawn = false
-gui.Parent = player:WaitForChild("PlayerGui")
+--// ─────────────────────────────────────────
+--// Auto Wheelie  (Kukirin-aware)
+--// ─────────────────────────────────────────
+--[[
+    The Kukirin scooter in "Drive a Kukirin" has a model hierarchy like:
+        Kukirin (Model)
+         ├─ Body          ← primary / root part
+         ├─ FrontWheel
+         ├─ BackWheel
+         └─ VehicleSeat  (or a Seat)
 
--- Main window
-local main = Instance.new("Frame")
-main.Name = "Main"
-main.Size = UDim2.new(0, 260, 0, 125)
-main.Position = UDim2.new(0.5, -130, 0.5, -62)
-main.BackgroundColor3 = Color3.fromRGB(10, 15, 20)
-main.BorderSizePixel = 0
-main.Parent = gui
+    To do a wheelie we:
+      1. Find the seat the player is in.
+      2. Grab the vehicle's Body (root) part.
+      3. Every Heartbeat, rotate that part backward (~-40°) so the
+         front lifts.  We only nudge it each frame so it fights gravity
+         continuously and looks like a real wheelie rather than a
+         one-shot snap.
+--]]
 
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 12)
-corner.Parent = main
+local wheelieConn
+local WHEELIE_ANGLE = math.rad(42)  -- how far to tilt back (degrees → radians)
 
--- Blue outline
-local stroke = Instance.new("UIStroke")
-stroke.Color = Color3.fromRGB(1, 152, 252)
-stroke.Thickness = 2
-stroke.Parent = main
+local function startWheelie()
+    if wheelieConn then wheelieConn:Disconnect() end
+    wheelieConn = RunService.Heartbeat:Connect(function(dt)
+        local seat = getOccupiedSeat()
+        if not seat then return end
 
--- Title
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, 0, 0, 45)
-title.BackgroundTransparency = 1
-title.Text = "ReconScripts"
-title.TextColor3 = Color3.fromRGB(1, 152, 252)
-title.TextSize = 25
-title.Font = Enum.Font.GothamBold
-title.Parent = main
+        local root = getVehicleRoot(seat)
+        if not root or root.Anchored then return end
 
--- Auto Wheelie button
-local wheelieButton = Instance.new("TextButton")
-wheelieButton.Size = UDim2.new(0, 220, 0, 45)
-wheelieButton.Position = UDim2.new(0.5, -110, 0, 55)
-wheelieButton.BackgroundColor3 = Color3.fromRGB(1, 90, 150)
-wheelieButton.BorderSizePixel = 0
-wheelieButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-wheelieButton.TextSize = 17
-wheelieButton.Font = Enum.Font.GothamBold
-wheelieButton.Text = "Auto Wheelie: OFF"
-wheelieButton.Parent = main
+        -- Build a target CFrame that keeps the same world position and Y-yaw
+        -- but pitches backward for the wheelie.
+        local pos   = root.CFrame.Position
+        local lookAt = root.CFrame.LookVector
+        -- Flatten lookAt onto the XZ plane so we only yaw, never roll
+        local flatLook = Vector3.new(lookAt.X, 0, lookAt.Z).Unit
+        if flatLook ~= flatLook then return end  -- NaN guard
 
-local wheelieCorner = Instance.new("UICorner")
-wheelieCorner.CornerRadius = UDim.new(0, 8)
-wheelieCorner.Parent = wheelieButton
+        local targetCF = CFrame.new(pos, pos + flatLook)
+            * CFrame.Angles(-WHEELIE_ANGLE, 0, 0)
 
---// Auto Wheelie toggle
-wheelieButton.MouseButton1Click:Connect(function()
-	autoWheelie = not autoWheelie
+        -- Lerp toward the target so it eases in smoothly
+        root.CFrame = root.CFrame:Lerp(targetCF, math.min(dt * 14, 1))
 
-	if autoWheelie then
-		wheelieButton.Text = "Auto Wheelie: ON"
-		wheelieButton.BackgroundColor3 = Color3.fromRGB(1, 152, 252)
-	else
-		wheelieButton.Text = "Auto Wheelie: OFF"
-		wheelieButton.BackgroundColor3 = Color3.fromRGB(1, 90, 150)
-	end
-end)
+        -- Kill vertical velocity so it doesn't launch into the air
+        local vel = root.AssemblyLinearVelocity
+        root.AssemblyLinearVelocity = Vector3.new(vel.X, math.max(vel.Y, 0), vel.Z)
+    end)
+end
+
+local function stopWheelie()
+    if wheelieConn then wheelieConn:Disconnect(); wheelieConn = nil end
+end
+
+--// ─────────────────────────────────────────
+--// Fly  (lifts the scooter + player together)
+--// ─────────────────────────────────────────
+--[[
+    Instead of just flying the character (which would detach from the
+    scooter), we fly the vehicle's root part directly.
+    The player stays seated and rises with it.
+    WASD steers as normal because the VehicleSeat still processes input.
+--]]
+
+local flyConn
+local flyTarget = nil   -- set when fly starts
+
+local function startFly()
+    if flyConn then flyConn:Disconnect() end
+
+    local seat = getOccupiedSeat()
+    local root = getVehicleRoot(seat)
+
+    -- If not on a scooter yet, fall back to character fly
+    if not root then
+        flyConn = RunService.Heartbeat:Connect(function()
+            local character = player.Character
+            if not character then return end
+            local hrp = character:FindFirstChild("HumanoidRootPart")
+            local hum = character:FindFirstChildOfClass("Humanoid")
+            if not hrp or not hum then return end
+            hum.PlatformStand = true
+            if hrp.Position.Y < FLY_HEIGHT - 2 then
+                hrp.CFrame = hrp.CFrame + Vector3.new(0, 5, 0)
+            end
+            local md = hum.MoveDirection
+            hrp.AssemblyLinearVelocity = Vector3.new(md.X * FLY_SPEED, 0, md.Z * FLY_SPEED)
+        end)
+        return
+    end
+
+    -- Target altitude: wherever the scooter is now + FLY_HEIGHT
+    flyTarget = root.Position.Y + FLY_HEIGHT
+
+    flyConn = RunService.Heartbeat:Connect(function(dt)
+        -- Re-grab seat each frame (player might remount)
+        local s = getOccupiedSeat()
+        local r = getVehicleRoot(s)
+        if not r then return end
+
+        local pos = r.Position
+        local vel = r.AssemblyLinearVelocity
+
+        -- Smoothly ascend to target altitude
+        if pos.Y < flyTarget - 1 then
+            r.AssemblyLinearVelocity = Vector3.new(vel.X, 28, vel.Z)
+        else
+            -- Hold altitude: zero out vertical velocity
+            r.AssemblyLinearVelocity = Vector3.new(vel.X, 0, vel.Z)
+        end
+
+        -- Zero gravity on the assembly so it doesn't fall
+        r.AssemblyAngularVelocity = Vector3.new(
+            r.AssemblyAngularVelocity.X * 0.85,
+            r.AssemblyAngularVelocity.Y,
+            r.AssemblyAngularVelocity.Z * 0.85
